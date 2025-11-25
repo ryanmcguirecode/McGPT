@@ -1,5 +1,7 @@
+from operator import inv
+from typing import cast
 import torch.nn as nn
-from torch import Tensor, inference_mode
+from torch import Tensor, embedding, inference_mode, arange, float32, outer
 from dataclasses import dataclass
 import torch.nn.functional as F
 
@@ -16,6 +18,9 @@ EmbeddingBatch = Tensor
 
 Logits = Tensor
 """ Model output - batch of sequences of 'un-normalized distributions' over vocab (input to softmax) - `[batch, sequence_len, vocab_size]` """
+
+RotaryEmbeddings = tuple[Tensor, Tensor]
+""" Precomputed rotary embeddings - (cos, sin) each of shape [sequence_len, attention_head_dim / 2] """
 
 
 def norm(x: EmbeddingBatch) -> EmbeddingBatch:
@@ -38,6 +43,33 @@ def relu_square(x: EmbeddingBatch) -> EmbeddingBatch:
 
     return F.relu(x).square()
 
+def precompute_rotary_embeddings(sequence_len: int, head_dim: int, base=10000, device=None) -> RotaryEmbeddings:
+    """ 
+    
+    Matrix form of rotation:
+        R(p, θ_i) = [
+            [cos(θ_i * p), -sin(θ_i * p)],
+            [sin(θ_i * p),  cos(θ_i * p)]
+        ]
+
+    where:
+        θ_i = base^(-i / head_dim)
+    """
+    
+    pair_indices: Tensor = arange(0, head_dim, 2, dtype=float32, device=device)
+    inv_freqs: Tensor = 1.0 / (base ** (pair_indices / head_dim))
+    sequence_indices: Tensor = arange(sequence_len, dtype=float32, device=device)
+
+    frequencies = outer(sequence_indices, inv_freqs) # [seq, head_dim/2] (θ_i for each pair)
+
+    cos: Tensor = frequencies.cos().bfloat16()
+    sin: Tensor = frequencies.sin().bfloat16()
+
+    return cos, sin
+
+def apply_rotary_embeddings(x: Tensor, embeddings: RotaryEmbeddings) -> Tensor:
+    ...
+
 
 @dataclass
 class GPTConfig:
@@ -46,29 +78,44 @@ class GPTConfig:
     sequence_len: int = 1024  # context window
     vocab_size: int = 50304  # number of tokens in vocab
     n_layer: int = 12  # number of layers
-    n_q_head: int = 6  # number of query heads
-    n_kv_head: int = 6  # number of key/value heads
+    n_head: int = 6  # number of key/value/query heads
     embedding_len: int = 768  # embedding dimension
 
 
 class MaskedSelfAttention(nn.Module):
     """ """
 
-    def __init__(self, config: GPTConfig, kv_cache: KVCache):
+    def __init__(self, config: GPTConfig, kv_cache: KVCache, layer_idx: int):
         super().__init__()
 
-        self.n_q_head = config.n_q_head
-        self.n_kv_head = config.n_kv_head
-        self.embedding_len = config.embedding_len
         self.kv_cache = kv_cache
+        self.layer_idx = layer_idx
 
-        self.K = nn.Linear(self.embedding_len, self.embedding_len * self.n_q_head)
-        self.V = nn.Linear(self.embedding_len, self.embedding_len * self.n_kv_head)
-        self.Q = nn.Linear(self.embedding_len, self.embedding_len * self.n_kv_head)
+        self.n_head = config.n_head
+        self.embedding_len = config.embedding_len
+
+        assert config.embedding_len % config.n_head == 0, "embedding dimension must be able to be divide equally into heads"
+        self.head_dim = config.embedding_len // config.n_head
+
+        self.W_K = nn.Linear(self.embedding_len, self.n_head * self.head_dim, bias=False) # key matrix
+        self.W_V = nn.Linear(self.embedding_len, self.n_head * self.head_dim, bias=False) # value matrix
+        self.W_Q = nn.Linear(self.embedding_len, self.n_head * self.head_dim, bias=False) # query matrix
+        self.W_proj = nn.Linear(self.embedding_len, self.embedding_len, bias=False) # projects back to embedding space
 
     @override
     def forward(self, x: EmbeddingBatch) -> EmbeddingBatch:
+        B, S, E = x.size() # (batch, sequence, embedding)
+
+        # project to K, V, Q subspaces, and reshape by segmenting across heads
+        K = self._apply(self.W_K, x).reshape(B, S, self.n_head, self.head_dim)
+        V = self._apply(self.W_V, x).reshape(B, S, self.n_head, self.head_dim)
+        Q = self._apply(self.W_Q, x).reshape(B, S, self.n_head, self.head_dim)
+        
         return x
+    
+    def _apply(self, M: nn.Linear, x: Tensor) -> Tensor:
+        """ Simply wrap multiplication for the sake of casting to Tensor  """
+        return cast(Tensor, M(x))
 
 
 class MLP(nn.Module):
@@ -89,7 +136,7 @@ class MLP(nn.Module):
 
     @override
     def forward(self, x: EmbeddingBatch) -> EmbeddingBatch:
-        x = self.layer_2(relu_square(self.layer_1(x)))
+        x = self.layer_1(x)
         x = relu_square(x)
         x = self.layer_2(x)
         return x
@@ -102,9 +149,9 @@ class Transformer(nn.Module):
     Doing pre-norm (normalization before each sublayer).
     """
 
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
-        self.attention = MaskedSelfAttention(config, KVCache())
+        self.attention = MaskedSelfAttention(config, KVCache(), layer_idx)
         self.mlp = MLP(config)
 
     @override
